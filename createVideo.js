@@ -11,7 +11,7 @@ const axios = require('axios');
 ffmpeg.setFfmpegPath(ffmpegInstaller.path);
 
 console.log('====================================================');
-console.log('   VIDEOCREATOR V5 - FLUX ZEROGPU + ROTEIRISTA IA   ');
+console.log('   VIDEOCREATOR V11 - PIXABAY -> IA FLUX -> UNSPLASH');
 console.log('====================================================');
 
 const credentialsPath = path.resolve(__dirname, process.env.GOOGLE_APPLICATION_CREDENTIALS || 'credentials.json');
@@ -21,14 +21,16 @@ if (!fs.existsSync(credentialsPath)) {
   process.exit(1);
 }
 
-// Define o caminho absoluto na variavel de ambiente oficial do Google e instancia sem parametros (zero avisos de depreciacao!)
 process.env.GOOGLE_APPLICATION_CREDENTIALS = credentialsPath;
 const ttsClient = new textToSpeech.TextToSpeechClient();
 
+const rawPixabayKey = (process.env.PIXABAY_API_KEY || '').trim();
 const rawHfToken = (process.env.HF_TOKEN || process.env.HUGGINGFACE_TOKEN || '').trim();
-if (rawHfToken) {
-  console.log(`[Status .env] HF_TOKEN detectado (${rawHfToken.substring(0, 6)}...${rawHfToken.slice(-4)})`);
-}
+const rawUnsplashKey = (process.env.UNSPLASH_ACCESS_KEY || '').trim();
+
+if (rawPixabayKey) console.log('[Status .env] 1. PIXABAY_API_KEY detectada');
+if (rawHfToken) console.log('[Status .env] 2. HF_TOKEN detectado (IA FLUX ativa)');
+if (rawUnsplashKey) console.log('[Status .env] 3. UNSPLASH_ACCESS_KEY detectada');
 
 const getUserInput = (question, defaultValue) => {
   const input = readline.question(`${question} (default: ${defaultValue}): `);
@@ -45,20 +47,44 @@ const sanitizeFileName = (text) => {
 };
 
 const formats = {
-  '1': { name: 'TikTok / Shorts / Reels (9:16)', size: '1080x1920', width: 720, height: 1280, aspectRatio: '9:16' },
-  '2': { name: 'YouTube Tradicional (16:9)', size: '1920x1080', width: 1280, height: 720, aspectRatio: '16:9' }
+  '1': { name: 'TikTok / Shorts / Reels (9:16)', size: '1080x1920', width: 720, height: 1280, orientation: 'vertical' },
+  '2': { name: 'YouTube Tradicional (16:9)', size: '1920x1080', width: 1280, height: 720, orientation: 'horizontal' }
 };
 
-const topicInput = getUserInput('\nTema ou texto do video', 'Ferrari');
-const videoLength = parseFloat(getUserInput('Digite a duracao do video em segundos', '30')) || 30;
+const topicInput = getUserInput('\nTema ou texto completo da narracao', 'Ferrari');
+const targetLength = parseFloat(getUserInput('Duracao desejada do video em segundos', '30')) || 30;
 
 console.log('\nEscolha o formato do video:');
 Object.keys(formats).forEach(key => console.log(`${key}: ${formats[key].name}`));
-
 const formatChoice = getUserInput('Opcao', '1');
 const selectedFormat = formats[formatChoice] || formats['1'];
 
-const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+// Mede a duracao exata do audio MP3 gerado usando o proprio FFmpeg
+const getAudioDuration = (audioPath) => {
+  return new Promise((resolve) => {
+    let stderrOutput = '';
+
+    ffmpeg(audioPath)
+      .outputOptions(['-f null'])
+      .output('-')
+      .on('stderr', (line) => {
+        stderrOutput += line + '\n';
+      })
+      .on('end', () => {
+        const match = stderrOutput.match(/Duration:\s*(\d{2}):(\d{2}):(\d{2}\.\d+)/);
+        if (match) {
+          const hours = parseFloat(match[1]);
+          const minutes = parseFloat(match[2]);
+          const seconds = parseFloat(match[3]);
+          resolve((hours * 3600) + (minutes * 60) + seconds);
+        } else {
+          resolve(null);
+        }
+      })
+      .on('error', () => resolve(null))
+      .run();
+  });
+};
 
 // Traduz automaticamente o tema de Portugues para Ingles
 const translateToEnglish = async (textPt) => {
@@ -72,73 +98,163 @@ const translateToEnglish = async (textPt) => {
   }
 };
 
-// Gera roteiro local ajustado proporcionalmente a duracao do video (15s, 30s, 60s)
-const buildDynamicLocalScript = (topic, durationSeconds) => {
-  if (topic.trim().length > 40) return topic.trim();
+// MOTOR ROTEIRISTA 1: LLM Criativo Gratuito
+const generateCreativeScriptWithAI = async (topic, durationSeconds, englishTopic) => {
+  const targetWords = Math.max(25, Math.floor(durationSeconds * 2.3));
+  const randomSeed = Math.floor(Math.random() * 999999);
 
-  const part1 = `Descubra tudo sobre ${topic}. Muito mais do que imaginamos no dia a dia, ${topic} reúne história, inovação e detalhes impressionantes que transformam a nossa visão de mundo.`;
-  const part2 = `Desde a sua criação até os dias atuais, cada elemento foi pensado para entregar máxima performance, estilo inconfundível e uma experiência verdadeiramente única para quem admira a perfeição.`;
-  const part3 = `Não é por acaso que ${topic} continua despertando tanta fascinação ao redor do planeta, tornando-se uma referência absoluta em sua categoria. Acompanhe cada detalhe dessa jornada surpreendente!`;
+  const systemPrompt = `Você é um roteirista criativo de vídeos educativos e documentários curtos (estilo YouTube Shorts e TikTok).
+Sua missão é explicar o assunto pedido de forma cativante, clara, informativa e original, trazendo curiosidades, como funciona ou sua importância histórica.
+Nunca use frases genéricas como "Descubra tudo sobre..." ou "Muito mais do que imaginamos...". Vá direto ao conteúdo explicando o tema!`;
 
-  if (durationSeconds <= 18) return part1;
-  if (durationSeconds <= 35) return `${part1} ${part2}`;
-  return `${part1} ${part2} ${part3}`;
+  const userPrompt = `Crie um roteiro para um vídeo de ${durationSeconds} segundos sobre o tema: "${topic}".
+Retorne APENAS um JSON válido (sem markdown, sem \`\`\`json) exatamente com esta estrutura:
+{
+  "narration": "Texto corrido em português do Brasil com aproximadamente ${targetWords} palavras, pronto para ser lido por um locutor, sem emojis, sem asteriscos e sem indicações de cena.",
+  "searchKeywords": "${englishTopic}",
+  "scenes": [
+    "Detailed photorealistic prompt in English for scene 1 specific to ${englishTopic}, cinematic lighting, 8k",
+    "Detailed photorealistic prompt in English for scene 2 showing another angle or aspect of ${englishTopic}, 8k",
+    "Detailed photorealistic prompt in English for scene 3 showing the impact or epic view of ${englishTopic}, 8k"
+  ]
+}`;
+
+  const response = await axios.post(
+    'https://text.pollinations.ai/openai',
+    {
+      model: 'openai',
+      seed: randomSeed,
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userPrompt }
+      ],
+      response_format: { type: 'json_object' }
+    },
+    {
+      headers: { 'Content-Type': 'application/json' },
+      timeout: 25000
+    }
+  );
+
+  const rawContent = response.data?.choices?.[0]?.message?.content || '';
+  const cleanedJson = rawContent.replace(/```json|```/g, '').trim();
+  const parsed = JSON.parse(cleanedJson);
+
+  if (!parsed.narration || parsed.narration.length < 30 || !Array.isArray(parsed.scenes) || parsed.scenes.length < 3) {
+    throw new Error('Resposta incompleta do roteirista IA');
+  }
+
+  return {
+    narration: parsed.narration.replace(/[*#"`]/g, '').trim(),
+    searchKeywords: parsed.searchKeywords || englishTopic,
+    scenes: parsed.scenes.slice(0, 3)
+  };
 };
 
-// Passo 0: Traduz o tema para Ingles e cria roteiro inedito
-const generateScriptAndPrompts = async (topic, durationSeconds) => {
-  const englishTopic = await translateToEnglish(topic);
-  console.log(`\n[Tradutor IA] Tema convertido para Ingles: "${topic}" -> "${englishTopic}"`);
+// MOTOR ROTEIRISTA 2 (Fallback): Busca Inteligente na Wikipedia
+const generateScriptFromSmartWikipedia = async (topic, durationSeconds, englishTopic) => {
+  const targetChars = Math.floor(durationSeconds * 14.2);
+  let collectedText = '';
+
+  const searchUrl = `https://pt.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(topic)}&srlimit=1&format=json`;
+  const searchRes = await axios.get(searchUrl, {
+    headers: { 'User-Agent': 'VideoCreatorBot/11.0 (NodeJS)' },
+    timeout: 8000
+  });
+
+  const bestTitle = searchRes.data?.query?.search?.[0]?.title || topic;
+
+  const extractUrl = `https://pt.wikipedia.org/w/api.php?action=query&prop=extracts&explaintext=1&exchars=2500&redirects=1&format=json&titles=${encodeURIComponent(bestTitle)}`;
+  const extractRes = await axios.get(extractUrl, {
+    headers: { 'User-Agent': 'VideoCreatorBot/11.0 (NodeJS)' },
+    timeout: 8000
+  });
+
+  const pages = extractRes.data?.query?.pages || {};
+  const pageId = Object.keys(pages)[0];
+  const fullExtract = pageId && pageId !== '-1' ? pages[pageId].extract : '';
+
+  if (fullExtract && fullExtract.length > 60) {
+    const cleanText = fullExtract
+      .replace(/==+[^=]+==+/g, ' ')
+      .replace(/\([^)]*\)/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    const sentences = cleanText.split(/(?<=[.!?])\s+/);
+
+    for (const s of sentences) {
+      if ((collectedText + ' ' + s).length <= targetChars + 35) {
+        collectedText = (collectedText + ' ' + s).trim();
+      } else {
+        break;
+      }
+    }
+  }
+
+  if (collectedText.length < 40) {
+    collectedText = `${topic} é um tema fascinante que despertou grande interesse ao longo da história pela sua importância e impacto direto na sociedade e na ciência. Compreender seus detalhes revela como cada elemento funciona de maneira extraordinária.`;
+  }
 
   const defaultScenes = [
     `Close-up cinematic photorealistic shot of ${englishTopic}, dramatic natural lighting, ultra detailed, 8k resolution`,
-    `Wide angle panoramic view of ${englishTopic} in motion, breathtaking scenery, movie scene, masterpiece photography`,
-    `Aerial golden hour perspective of ${englishTopic}, vibrant colors, award winning automotive and lifestyle photo`
+    `Wide angle panoramic view of ${englishTopic}, breathtaking scenery, movie scene, masterpiece photography`,
+    `Aerial golden hour perspective of ${englishTopic}, vibrant colors, award winning national geographic style photo`
   ];
 
-  // Se o proprio usuario ja digitou um texto longo de narracao, usa direto
-  if (topic.trim().length > 40) {
-    return { narration: topic.trim(), scenes: defaultScenes };
+  return { narration: collectedText, searchKeywords: englishTopic, scenes: defaultScenes };
+};
+
+// Passo 0: Orquestrador do Roteiro e Cenas Visuais
+const generateScriptAndPrompts = async (topic, durationSeconds) => {
+  const isCustomLongText = topic.trim().length > 50;
+  const visualSubject = isCustomLongText
+    ? topic.trim().split(/\s+/).slice(0, 5).join(' ')
+    : topic.trim();
+
+  const englishTopic = await translateToEnglish(visualSubject);
+
+  if (isCustomLongText) {
+    console.log(`\n[Roteiro Personalizado Detectado]: "${topic.trim()}"`);
+    return {
+      narration: topic.trim(),
+      searchKeywords: englishTopic,
+      scenes: [
+        `Close-up cinematic photorealistic shot of ${englishTopic}, dramatic lighting, 8k`,
+        `Wide angle panoramic view of ${englishTopic}, breathtaking atmosphere, masterpiece`,
+        `Epic detailed perspective of ${englishTopic}, vibrant colors, award winning photography`
+      ]
+    };
   }
 
-  const wordCount = Math.max(25, Math.floor(durationSeconds * 2.3));
-
-  // Tenta buscar curiosidades reais na Wikipedia em Portugues para enriquecer a narracao gratuitamente!
   try {
-    console.log(`[IA Roteirista] Pesquisando fatos reais sobre "${topic}" para a narracao...`);
-    const wikiUrl = `https://pt.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(topic.trim())}`;
-    const wikiRes = await axios.get(wikiUrl, {
-      headers: { 'User-Agent': 'VideoCreatorBot/5.0 (NodeJS)' },
-      timeout: 8000
-    });
-
-    const extract = wikiRes.data?.extract;
-    if (extract && extract.length > 60) {
-      // Ajusta o tamanho do resumo para caber nos segundos do video (~14 caracteres por segundo de fala)
-      const maxChars = Math.floor(durationSeconds * 13.5);
-      const sentences = extract.split(/(?<=[.!?])\s+/);
-      let finalScript = '';
-
-      for (const s of sentences) {
-        if ((finalScript + ' ' + s).length <= maxChars || finalScript.length < 80) {
-          finalScript = (finalScript + ' ' + s).trim();
-        } else {
-          break;
-        }
-      }
-
-      if (finalScript.length > 40) {
-        console.log(`[Roteiro Real Criado (${finalScript.split(' ').length} palavras)]: "${finalScript}"`);
-        return { narration: finalScript, scenes: defaultScenes };
-      }
-    }
-  } catch (_) {
-    // Se nao achar artigo exato, usa o gerador dinamico por tempo
+    console.log(`\n[IA Roteirista] Criando explicacao unica e roteiro visual sobre "${topic}"...`);
+    const creativeResult = await generateCreativeScriptWithAI(topic, durationSeconds, englishTopic);
+    const wordCount = creativeResult.narration.split(/\s+/).length;
+    console.log(`[Roteiro Criativo Gerado (${wordCount} palavras)]:\n"${creativeResult.narration}"`);
+    return creativeResult;
+  } catch (err) {
+    console.warn(`[Aviso Roteirista IA]: ${err.message}. Acionando Busca Inteligente Wikipedia...`);
   }
 
-  const fallbackText = buildDynamicLocalScript(topic, durationSeconds);
-  console.log(`[Roteiro Automatico (${durationSeconds}s)]: "${fallbackText}"`);
-  return { narration: fallbackText, scenes: defaultScenes };
+  try {
+    const wikiResult = await generateScriptFromSmartWikipedia(topic, durationSeconds, englishTopic);
+    const wordCount = wikiResult.narration.split(/\s+/).length;
+    console.log(`[Roteiro Enciclopedico Gerado (${wordCount} palavras)]:\n"${wikiResult.narration}"`);
+    return wikiResult;
+  } catch (err) {
+    console.warn(`[Aviso Wikipedia]: ${err.message}`);
+  }
+
+  return {
+    narration: `Vamos explorar os detalhes essenciais sobre ${topic}, entendendo sua origem, suas principais características e por que esse assunto chama tanta atenção nos dias de hoje.`,
+    searchKeywords: englishTopic,
+    scenes: [
+      `Close-up cinematic shot of ${englishTopic}, 8k`,
+      `Wide angle view of ${englishTopic}, cinematic lighting`,
+      `Detailed perspective of ${englishTopic}, photorealistic`
+    ]
+  };
 };
 
 // Passo 1: Gera audio localmente via Google Cloud TTS
@@ -170,7 +286,34 @@ const generateNarration = async (textToSynthesize) => {
   return null;
 };
 
-// MOTOR PRINCIPAL: Hugging Face ZeroGPU Gradio Space (FLUX.1-schnell Oficial - Funcionando 100%!)
+// =========================================================================
+// FONTES DE IMAGENS EM ORDEM AUTOMÁTICA: 1. PIXABAY -> 2. IA FLUX -> 3. UNSPLASH
+// =========================================================================
+
+// Fonte 1: Pixabay API
+const fetchFromPixabay = async (query, neededCount, startIndex, orientation) => {
+  if (!rawPixabayKey) throw new Error('PIXABAY_API_KEY nao configurada');
+
+  const url = `https://pixabay.com/api/?key=${rawPixabayKey}&q=${encodeURIComponent(query)}&image_type=photo&orientation=${orientation}&safesearch=true&per_page=${neededCount + 4}`;
+  const res = await axios.get(url, { timeout: 15000 });
+  const hits = res.data?.hits || [];
+
+  if (hits.length === 0) throw new Error('Nenhuma foto encontrada no Pixabay');
+
+  const downloaded = [];
+  for (let i = 0; i < Math.min(neededCount, hits.length); i++) {
+    const sceneNum = startIndex + i + 1;
+    const imgUrl = hits[i].largeImageURL || hits[i].webformatURL;
+    const imgPath = path.resolve(__dirname, `scene_img_${sceneNum}.jpg`);
+    const imgRes = await axios.get(imgUrl, { responseType: 'arraybuffer', timeout: 25000 });
+    await util.promisify(fs.writeFile)(imgPath, Buffer.from(imgRes.data));
+    downloaded.push(imgPath);
+    console.log(` -> [1. Pixabay] Cena ${sceneNum}/3 baixada (ID: ${hits[i].id})!`);
+  }
+  return downloaded;
+};
+
+// Fonte 2: IA FLUX.1-schnell (Hugging Face ZeroGPU)
 const generateWithHFZeroGPUSpace = async (prompt, outputPath, width, height) => {
   const spaceUrl = 'https://black-forest-labs-flux-1-schnell.hf.space';
   const headers = { 'Content-Type': 'application/json' };
@@ -181,9 +324,7 @@ const generateWithHFZeroGPUSpace = async (prompt, outputPath, width, height) => 
 
   const callRes = await axios.post(
     `${spaceUrl}/gradio_api/call/infer`,
-    {
-      data: [prompt, 0, true, w, h, 4]
-    },
+    { data: [prompt, 0, true, w, h, 4] },
     { headers, timeout: 20000 }
   );
 
@@ -205,7 +346,7 @@ const generateWithHFZeroGPUSpace = async (prompt, outputPath, width, height) => 
         if (fileUrl) {
           const imgRes = await axios.get(fileUrl, { responseType: 'arraybuffer', timeout: 25000 });
           await util.promisify(fs.writeFile)(outputPath, Buffer.from(imgRes.data));
-          return 'FLUX.1-schnell (ZeroGPU Space)';
+          return true;
         }
       } catch (_) {}
     }
@@ -214,90 +355,94 @@ const generateWithHFZeroGPUSpace = async (prompt, outputPath, width, height) => 
   throw new Error('ZeroGPU Space nao retornou imagem');
 };
 
-// MOTOR SECUNDARIO DE BACKUP: AI Horde (Cluster Stable Diffusion 100% Gratuito)
-const generateWithStableHorde = async (prompt, outputPath, width, height) => {
-  const sdWidth = width > height ? 576 : 384;
-  const sdHeight = height > width ? 576 : 384;
+// Fonte 3: Unsplash API
+const fetchFromUnsplash = async (query, neededCount, startIndex, orientation) => {
+  if (!rawUnsplashKey) throw new Error('UNSPLASH_ACCESS_KEY nao configurada');
 
-  const submitRes = await axios.post(
-    'https://stablehorde.net/api/v2/generate/async',
-    {
-      prompt: `${prompt} ### blurry, ugly, deformed, bad anatomy, text, watermark`,
-      params: {
-        width: sdWidth,
-        height: sdHeight,
-        steps: 22,
-        cfg_scale: 7.5,
-        sampler_name: 'k_euler_a'
-      },
-      nsfw: false,
-      censor_nsfw: true
-    },
-    {
-      headers: {
-        'apikey': process.env.HORDE_API_KEY || '0000000000',
-        'Client-Agent': 'VideoCreatorCLI:5.0:NodeJS'
-      },
-      timeout: 15000
-    }
-  );
+  const unsplashOrient = orientation === 'vertical' ? 'portrait' : 'landscape';
+  const url = `https://api.unsplash.com/search/photos?query=${encodeURIComponent(query)}&orientation=${unsplashOrient}&per_page=${neededCount + 2}`;
 
-  const jobId = submitRes.data.id;
-  for (let check = 0; check < 22; check++) {
-    await delay(3500);
-    const statusRes = await axios.get(`https://stablehorde.net/api/v2/generate/status/${jobId}`, {
-      headers: { 'Client-Agent': 'VideoCreatorCLI:5.0:NodeJS' }
-    });
+  const res = await axios.get(url, {
+    headers: { 'Authorization': `Client-ID ${rawUnsplashKey}` },
+    timeout: 15000
+  });
 
-    if (statusRes.data.done && statusRes.data.generations?.length > 0) {
-      const imgUrl = statusRes.data.generations[0].img;
-      const imgRes = await axios.get(imgUrl, { responseType: 'arraybuffer', timeout: 25000 });
-      await util.promisify(fs.writeFile)(outputPath, Buffer.from(imgRes.data));
-      return true;
-    }
+  const results = res.data?.results || [];
+  if (results.length === 0) throw new Error('Nenhuma foto encontrada no Unsplash');
+
+  const downloaded = [];
+  for (let i = 0; i < Math.min(neededCount, results.length); i++) {
+    const sceneNum = startIndex + i + 1;
+    const imgUrl = results[i].urls?.regular || results[i].urls?.full;
+    const imgPath = path.resolve(__dirname, `scene_img_${sceneNum}.jpg`);
+    const imgRes = await axios.get(imgUrl, { responseType: 'arraybuffer', timeout: 25000 });
+    await util.promisify(fs.writeFile)(imgPath, Buffer.from(imgRes.data));
+    downloaded.push(imgPath);
+    console.log(` -> [3. Unsplash] Cena ${sceneNum}/3 baixada (Foto por ${results[i].user?.name})!`);
   }
-  throw new Error('Fila do AI Horde demorou muito');
+  return downloaded;
 };
 
-// Passo 2: Orquestrador de Imagens (Direto no FLUX.1-schnell ZeroGPU -> Backup AI Horde)
-const generateImagesWithAI = async (scenes, formatObj) => {
-  const localImagePaths = [];
+// Orquestrador Automatico: 1. Pixabay -> 2. IA FLUX -> 3. Unsplash
+const collectVisualAssetsAutomatic = async (scriptData, formatObj) => {
+  const totalNeeded = 3;
+  const collectedPaths = [];
 
-  for (let i = 0; i < scenes.length; i++) {
-    const scenePrompt = scenes[i];
-    const localImagePath = path.resolve(__dirname, `ai_img_${i + 1}.webp`);
-    let saved = false;
-
-    console.log(`\nGerando cena ${i + 1}/${scenes.length} via FLUX.1-schnell...`);
-
-    // 1. Vai direto no Hugging Face ZeroGPU Space (que funcionou perfeitamente na sua conta!)
+  // ETAPA 1: PIXABAY (Primeira Opcao)
+  if (collectedPaths.length < totalNeeded) {
     try {
-      const spaceUsed = await generateWithHFZeroGPUSpace(scenePrompt, localImagePath, formatObj.width, formatObj.height);
-      saved = true;
-      console.log(` -> SUCESSO! Cena ${i + 1} gerada via ${spaceUsed}!`);
+      console.log(`[Fonte 1/3 - Pixabay] Buscando imagens para "${scriptData.searchKeywords}"...`);
+      const pixabayImgs = await fetchFromPixabay(
+        scriptData.searchKeywords,
+        totalNeeded - collectedPaths.length,
+        collectedPaths.length,
+        formatObj.orientation
+      );
+      collectedPaths.push(...pixabayImgs);
     } catch (e) {
-      console.warn(` -> Aviso ZeroGPU (${e.message}). Acionando backup AI Horde...`);
-    }
-
-    // 2. Fallback Garantido: AI Horde
-    if (!saved) {
-      try {
-        await generateWithStableHorde(scenePrompt, localImagePath, formatObj.width, formatObj.height);
-        saved = true;
-        console.log(` -> Cena ${i + 1} gerada com sucesso via AI Horde!`);
-      } catch (e) {
-        console.warn(` -> Aviso AI Horde: ${e.message}`);
-      }
-    }
-
-    if (saved) {
-      localImagePaths.push(localImagePath);
-    } else if (localImagePaths.length > 0) {
-      localImagePaths.push(localImagePaths[localImagePaths.length - 1]);
+      console.warn(` -> Pixabay pulado/incompleto (${e.message}).`);
     }
   }
 
-  return localImagePaths;
+  // ETAPA 2: IA FLUX.1-SCHNELL (Segunda Opcao - completa o que faltar)
+  while (collectedPaths.length < totalNeeded) {
+    const currentIndex = collectedPaths.length;
+    const scenePrompt = scriptData.scenes[currentIndex] || scriptData.scenes[0];
+    const imgPath = path.resolve(__dirname, `scene_img_${currentIndex + 1}.jpg`);
+
+    try {
+      console.log(`[Fonte 2/3 - IA FLUX] Gerando cena ${currentIndex + 1}/${totalNeeded} via Inteligencia Artificial...`);
+      await generateWithHFZeroGPUSpace(scenePrompt, imgPath, formatObj.width, formatObj.height);
+      collectedPaths.push(imgPath);
+      console.log(` -> [2. IA FLUX] Cena ${currentIndex + 1}/3 gerada com sucesso!`);
+    } catch (e) {
+      console.warn(` -> IA FLUX falhou na cena ${currentIndex + 1} (${e.message}). Passando para Unsplash...`);
+      break;
+    }
+  }
+
+  // ETAPA 3: UNSPLASH (Terceira e Ultima Opcao - completa o restante)
+  if (collectedPaths.length < totalNeeded) {
+    try {
+      console.log(`[Fonte 3/3 - Unsplash] Buscando ${totalNeeded - collectedPaths.length} imagem(ns) restante(s) para "${scriptData.searchKeywords}"...`);
+      const unsplashImgs = await fetchFromUnsplash(
+        scriptData.searchKeywords,
+        totalNeeded - collectedPaths.length,
+        collectedPaths.length,
+        formatObj.orientation
+      );
+      collectedPaths.push(...unsplashImgs);
+    } catch (e) {
+      console.warn(` -> Aviso Unsplash (${e.message}).`);
+    }
+  }
+
+  // Seguranca final: se conseguiu pelo menos 1 imagem, duplica caso tenha faltado alguma para fechar 3 cenas
+  while (collectedPaths.length > 0 && collectedPaths.length < totalNeeded) {
+    collectedPaths.push(collectedPaths[collectedPaths.length - 1]);
+  }
+
+  return collectedPaths;
 };
 
 // Passo 3: Transforma cada imagem em um clipe animado (Efeito Camera em Movimento / Ken Burns)
@@ -309,7 +454,7 @@ const createAnimatedClips = async (imagePaths, clipDuration, resolution) => {
 
   for (let i = 0; i < imagePaths.length; i++) {
     const clipPath = path.resolve(__dirname, `temp_clip_${i + 1}.mp4`);
-    console.log(`Animando cena ${i + 1}/${imagePaths.length} com movimento de camera...`);
+    console.log(`Animando cena ${i + 1}/${imagePaths.length} (${clipDuration}s) com movimento de camera...`);
 
     let zoomExpr = `min(zoom+0.0015,1.35)`;
     if (i === 1) zoomExpr = `if(eq(on,1),1.35,max(1.05,zoom-0.0015))`;
@@ -368,7 +513,7 @@ const buildVideoWithFFmpeg = async (imagePaths, audioPath, outputPath, resolutio
       ])
       .output(outputPath)
       .on('start', () => {
-        console.log(`\nUnindo animacoes e narracao no video final...`);
+        console.log(`\nUnindo animacoes e narracao no video final (${totalDuration}s)...`);
       })
       .on('end', () => {
         if (fs.existsSync(listFilePath)) fs.unlinkSync(listFilePath);
@@ -389,23 +534,32 @@ const buildVideoWithFFmpeg = async (imagePaths, audioPath, outputPath, resolutio
 // Fluxo principal
 const createVideo = async () => {
   try {
-    const safeTitle = sanitizeFileName(topicInput);
+    const safeTitle = sanitizeFileName(topicInput.split(/\s+/).slice(0, 4).join(' '));
     const outputFileName = `video-${safeTitle || 'final'}.mp4`;
     const outputPath = path.resolve(__dirname, outputFileName);
 
     console.log(`\nArquivo final sera salvo como: ${outputFileName}`);
 
-    const scriptData = await generateScriptAndPrompts(topicInput, videoLength);
+    const scriptData = await generateScriptAndPrompts(topicInput, targetLength);
 
     console.log('\n[1/3] Gerando audio da narracao...');
     const audioPath = await generateNarration(scriptData.narration);
     if (!audioPath) return;
 
-    console.log(`\n[2/3] Gerando 3 imagens de alta definicao via FLUX.1-schnell...`);
-    const imagePaths = await generateImagesWithAI(scriptData.scenes, selectedFormat);
+    const exactAudioDuration = await getAudioDuration(audioPath);
+    const finalVideoDuration = exactAudioDuration
+      ? parseFloat(Math.max(targetLength, exactAudioDuration + 0.8).toFixed(2))
+      : targetLength;
+
+    if (exactAudioDuration) {
+      console.log(`[Sincronizacao] Fala real: ${exactAudioDuration.toFixed(2)}s | Solicitado: ${targetLength}s -> Duracao final: ${finalVideoDuration}s`);
+    }
+
+    console.log(`\n[2/3] Coletando 3 imagens (Pixabay -> IA FLUX -> Unsplash)...`);
+    const imagePaths = await collectVisualAssetsAutomatic(scriptData, selectedFormat);
 
     if (imagePaths.length === 0) {
-      console.error('Nenhuma imagem foi gerada.');
+      console.error('Nenhuma imagem foi encontrada ou gerada em nenhuma das 3 fontes.');
       return;
     }
 
@@ -415,7 +569,7 @@ const createVideo = async () => {
       audioPath,
       outputPath,
       selectedFormat.size,
-      videoLength
+      finalVideoDuration
     );
   } catch (error) {
     console.error('Falha geral no processo:', error.message);
